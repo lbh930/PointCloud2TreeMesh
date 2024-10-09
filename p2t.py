@@ -1,146 +1,123 @@
+import CSF
 import laspy
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-from scipy.ndimage import gaussian_filter
-from scipy.stats import binned_statistic_2d
-from skimage.feature import peak_local_max
+import open3d as o3d
 
 # Step 1: Load the LAS File
-# Replace 'your_pointcloud.las' with the path to your LAS file
-las = laspy.read('cloud.las')
+las = laspy.read('cloud_sub.las')
 
-# Extract point coordinates
+# Step 2: Extract point cloud data (X, Y, Z coordinates)
 points = np.vstack((las.x, las.y, las.z)).transpose()
 
-# Remove points with height lower than 180
-points = points[points[:, 2] > 186]
+# Normalize points to set Z grounded at 0
+points[:, 2] -= points[:, 2].min()
 
-# Step 2: Generate a Height Map
-# Define grid resolution (adjust based on point cloud density)
-grid_size = 0.5  # Grid cell size in units matching your data (e.g., meters)
+# Step 3: Extract color information (Red, Green, Blue)
+colors = np.vstack((las.red, las.green, las.blue)).transpose()
+colors = colors / 65535.0  # Normalize colors to [0, 1] range
 
-# Compute grid boundaries
-x_min, x_max = points[:, 0].min(), points[:, 0].max()
-y_min, y_max = points[:, 1].min(), points[:, 1].max()
+# Step 4: Set up CSF for ground point classification
+csf = CSF.CSF()
+csf.params.bSloopSmooth = True    # Optional: Smooth slope (set based on your needs)
+csf.params.cloth_resolution = 0.1 # Resolution of the cloth (higher means more detailed)
+csf.params.rigidness = 3          # Rigidness of the cloth
+csf.params.time_step = 0.65       # Time step for simulation
 
-# Create grid edges
-x_edges = np.arange(x_min, x_max + grid_size, grid_size)
-y_edges = np.arange(y_min, y_max + grid_size, grid_size)
+# Step 5: Load the points into CSF
+csf.setPointCloud(points)
 
-# Compute the height map using the maximum elevation in each grid cell
-height_map, x_edges, y_edges, _ = binned_statistic_2d(
-    points[:, 0], points[:, 1], points[:, 2],
-    statistic='max', bins=[x_edges, y_edges]
-)
+# Step 6: Perform ground filtering using CSF
+ground_indexes = CSF.VecInt()  # List for ground point indexes
+non_ground_indexes = CSF.VecInt()  # List for non-ground point indexes
 
-# Step 3: Ground Segmentation
-# Define a threshold to separate ground from vegetation
-ground_threshold = 186  # Adjust based on the minimum vegetation height
+csf.do_filtering(ground_indexes, non_ground_indexes)  # Use lists to store the indexes
 
-# Create masks for ground and vegetation (optional)
-ground_mask = np.logical_and(height_map < ground_threshold, ~np.isnan(height_map))
-vegetation_mask = np.logical_and(height_map >= ground_threshold, ~np.isnan(height_map))
+# Step 7: Extract ground points and their colors using the ground indexes
+ground_points = points[ground_indexes]
+ground_colors = colors[ground_indexes]
 
-# Step 4: Smooth the Height Map
-# Handle NaN values by replacing them with the minimum valid height
-min_height = np.nanmin(height_map)
-height_map_filled = np.nan_to_num(height_map, nan=min_height)
+# Step 8: Extract non-ground points (tree points)
+tree_points = points[non_ground_indexes]
+tree_colors = colors[non_ground_indexes]
 
-# Apply Gaussian smoothing to the height map
-sigma = 1  # Standard deviation for Gaussian kernel (adjust as needed)
-smoothed_height_map = gaussian_filter(height_map_filled, sigma=sigma)
+# Step 9: Export tree points to a LAS file
+output_file = laspy.create(point_format=las.point_format, file_version=las.header.version)
+output_file.points = laspy.ScaleAwarePointRecord(points[non_ground_indexes], las.point_format)
+output_file.write('output/segment_tree.las')
+print("Tree points have been exported to 'output/segment_tree.las'.")
 
-# Step 5: Detect Tree Locations
-# Prepare the smoothed height map for peak detection
-smoothed_min = np.nanmin(smoothed_height_map)
-smoothed_height_map_prepared = np.nan_to_num(smoothed_height_map, nan=smoothed_min - 1)
+# Step 10: Visualize tree points with Open3D using smaller point size
+tree_pcd = o3d.geometry.PointCloud()
+tree_pcd.points = o3d.utility.Vector3dVector(tree_points)
+tree_pcd.colors = o3d.utility.Vector3dVector(tree_colors)
 
-# Define minimum distance between tree peaks in pixels
-tree_spacing_meters = 2.0  # Minimum expected distance between trees
-min_distance = max(1, int(tree_spacing_meters / grid_size))
+# Set rendering options for smaller point size
+vis = o3d.visualization.Visualizer()
+vis.create_window(window_name="Tree Points Visualization")
+vis.add_geometry(tree_pcd)
+opt = vis.get_render_option()
+opt.point_size = 1.0  # Smaller point size for rendering
+vis.run()
+vis.destroy_window()
 
-# Detect local maxima (tree tops) in the smoothed height map
-coordinates = peak_local_max(
-    smoothed_height_map_prepared,
-    min_distance=min_distance,
-    threshold_abs=ground_threshold
-)
-# 计算网格中心
-x_centers = (x_edges[:-1] + x_edges[1:]) / 2
-y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+# Step 11: Slice tree points by height and detect trees
+height_min = 1.0
+height_max = 7.0
+slice_height = 1.0  # Thickness of slice
 
-# 提取树的位置（交换索引顺序）
-tree_x = x_centers[coordinates[:, 0]]
-tree_y = y_centers[coordinates[:, 1]]
-tree_z = smoothed_height_map[coordinates[:, 0], coordinates[:, 1]]
+slice_results = []
 
-# 调试信息
-print("x_centers.shape:", x_centers.shape)
-print("y_centers.shape:", y_centers.shape)
-print("coordinates.shape:", coordinates.shape)
-print("Max index in coordinates[:, 0]:", np.max(coordinates[:, 0]))
-print("Max index in coordinates[:, 1]:", np.max(coordinates[:, 1]))
+# Slice by height range
+current_height = height_min
+while current_height < height_max:
+    mask = np.logical_and(tree_points[:, 2] >= current_height, tree_points[:, 2] < current_height + slice_height)
+    slice_points = tree_points[mask]
+    
+    if len(slice_points) > 0:
+        slice_points_2d = slice_points[:, :2]  # Only take X and Y coordinates
+        
+        # Use DBSCAN clustering algorithm
+        from sklearn.cluster import DBSCAN
+        clustering = DBSCAN(eps=0.2, min_samples=5).fit(slice_points_2d)
+        labels = clustering.labels_
+        
+        # Get clustering results, -1 means noise
+        unique_labels = set(labels)
+        unique_labels.discard(-1)  # Remove noise label
+        
+        # Calculate centroids for each cluster
+        tree_positions = []
+        for label in unique_labels:
+            class_member_mask = (labels == label)
+            xy = slice_points_2d[class_member_mask]
+            centroid = xy.mean(axis=0)
+            tree_positions.append(centroid)
+        
+        # Add current slice results to list
+        slice_results.append({
+            'height_range': (current_height, current_height + slice_height),
+            'tree_positions': tree_positions
+        })
+    
+    # Update height
+    current_height += slice_height
 
+# Select a specific height range slice and visualize
+selected_slice = None
+for result in slice_results:
+    if result['height_range'] == (1.0, 2.0):
+        selected_slice = result
+        break
 
-# Step 6: Visualize Intermediate Results
-# Visualize the original height map
-plt.figure(figsize=(10, 8))
-plt.imshow(
-    height_map.T,
-    extent=(x_min, x_max, y_min, y_max),
-    origin='lower',
-    cmap='terrain'
-)
-plt.title('Original Height Map')
-plt.xlabel('X Coordinate')
-plt.ylabel('Y Coordinate')
-plt.colorbar(label='Height (m)')
-plt.show()
-
-# Visualize the smoothed height map
-plt.figure(figsize=(10, 8))
-plt.imshow(
-    smoothed_height_map.T,
-    extent=(x_min, x_max, y_min, y_max),
-    origin='lower',
-    cmap='terrain'
-)
-plt.title('Smoothed Height Map')
-plt.xlabel('X Coordinate')
-plt.ylabel('Y Coordinate')
-plt.colorbar(label='Height (m)')
-plt.show()
-
-# Visualize detected tree locations on the smoothed height map
-plt.figure(figsize=(10, 8))
-plt.imshow(
-    smoothed_height_map.T,
-    extent=(x_min, x_max, y_min, y_max),
-    origin='lower',
-    cmap='terrain'
-)
-plt.scatter(
-    tree_x,
-    tree_y,
-    c='red',
-    s=10,
-    label='Detected Trees'
-)
-plt.title('Detected Tree Locations')
-plt.xlabel('X Coordinate')
-plt.ylabel('Y Coordinate')
-plt.legend()
-plt.colorbar(label='Height (m)')
-plt.show()
-
-# Step 7: Output Tree Locations
-# Create a DataFrame with tree coordinates and heights
-tree_locations = pd.DataFrame({
-    'X': tree_x,
-    'Y': tree_y,
-    'Z': tree_z
-})
-
-# Save the tree locations to a CSV file
-tree_locations.to_csv('tree_locations.csv', index=False)
+if selected_slice is not None:
+    tree_positions = np.array(selected_slice['tree_positions'])
+    plt.scatter(tree_points[:, 0], tree_points[:, 1], s=1, c='gray', label='Point Cloud')
+    plt.scatter(tree_positions[:, 0], tree_positions[:, 1], s=50, c='red', marker='x', label='Detected Trees')
+    plt.title(f'Tree Detection at Height {selected_slice["height_range"][0]}-{selected_slice["height_range"][1]} m')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.legend()
+    plt.show()
+else:
+    print('No data for the selected height range.')
