@@ -5,7 +5,7 @@ import numpy as np
 import open3d as o3d
 
 # Step 1: Load the LAS File
-las = laspy.read('cloud_sub.las')
+las = laspy.read('cloud.las')
 
 # Step 2: Extract point cloud data (X, Y, Z coordinates)
 points = np.vstack((las.x, las.y, las.z)).transpose()
